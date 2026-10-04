@@ -1,20 +1,24 @@
-照片氣氛動畫播放器 Android APK 包裝專案
-Web 版本：v0.3.8
+照片氣氛動畫播放器 Android APK 專用修正版
+APK 版本：v0.3.9
+基準：v0.3.8 / Build APK #21 成功安裝版
+日期時間：2026-10-04 11:06
 
-這個專案已把 v0.3.8 單檔 HTML 放進 Android WebView。
+本版只針對 APK / Android WebView 相容性調整，不改原本網頁母版。
 
-最省事的雲端打包方式：
-1. 把整個專案資料夾上傳到 GitHub repository。
-2. GitHub → Actions → Build APK → Run workflow。
-3. 建置完成後下載 artifact：photo-atmosphere-player-v0.3.8-apk。
-4. 解壓後得到 app-debug.apk，可在 Android 裝置安裝測試。
+本次修正：
+1. 字幕、音樂、字型：改用較穩定的 Android 原生文件選擇流程，降低 WebView 對副檔名/MIME 判斷造成的載入失敗。
+2. 載入資料夾：按鈕改由 Android 系統資料夾選擇器處理；會遞迴找出 MP3/M4A/AAC/WAV/OGG/FLAC 與 LRC/SRT，再交回原本播放器配對。
+3. 全螢幕返回：Android 返回手勢會先退出播放器全螢幕，再回到正常畫面，不直接走關閉程式流程。
+4. APK 介面字型 fresh default：138% → 120%。舊 APK 若仍是舊預設 138%，第一次進 v0.3.9 會一次性調成 120%；之後仍可自行用－／＋調整。
+5. GitHub Actions：只有 .build-trigger 更新或手動 Run workflow 才打包，避免上傳 ZIP 每個檔案都觸發一次 Build APK。
 
-本包裝已包含：
-- JavaScript / localStorage / 音訊播放
-- 照片、音樂、字幕、字型的檔案選擇器
-- Web 版 v0.3.8 全部 HTML/CSS/JS 與內嵌素材
-- Android 返回手勢防誤退出：第一次返回會提示，再按一次才離開
+保留／回歸原則：
+- v0.3.8 已確認可用的照片、MP4、播放、主題、字幕樣式、音波、氣氛、構圖等 HTML 功能不改邏輯。
+- applicationId 保持 com.taro.atmosphereplayer，可直接覆蓋安裝測試版。
+- 原 v0.3.8 基準專案另保留備份，不覆蓋。
 
-注意：
-- Android WebView 對「整個資料夾選取」的支援可能跟 Chrome 不完全相同；單檔/多檔選取可先測。
-- 系統螢幕錄影仍使用 Android 原生螢幕錄影即可。
+打包：
+- 用私人工具管理中心把本 ZIP 更新到既有 photo-atmosphere-player-apk repo。
+- 建議使用「完整取代」。
+- 上傳時工作流程不會每個檔案都跑；最後 .build-trigger 更新後才會跑一次。
+- 成功後到 Actions → Build APK → 最新綠色勾勾 → Artifacts 下載 photo-atmosphere-player-v0.3.9-apk。
