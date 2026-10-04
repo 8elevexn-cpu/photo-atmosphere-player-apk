@@ -6,6 +6,7 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.database.Cursor;
+import android.provider.OpenableColumns;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -26,10 +27,13 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -43,12 +47,15 @@ public class MainActivity extends Activity {
     private static final int FOLDER_CHOOSER_REQUEST = 7002;
     private static final int MAX_FOLDER_FILES = 1000;
     private static final String APK_FOLDER_MIME = "application/x-photo-atmosphere-folder";
+    private static final String APK_SUBTITLE_MIME = "application/x-photo-atmosphere-subtitle";
 
     private WebView webView;
     private ValueCallback<Uri[]> fileCallback;
     private long lastBackAt = 0L;
     private boolean backCheckPending = false;
     private boolean nativeFullscreen = false;
+    private String pendingChooserKind = "";
+    private String lastPickedFilesJson = "[]";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -84,6 +91,7 @@ public class MainActivity extends Activity {
                     fileCallback.onReceiveValue(null);
                 }
                 fileCallback = callback;
+                pendingChooserKind = classifyChooser(params);
 
                 try {
                     if (isFolderChooser(params)) {
@@ -122,6 +130,37 @@ public class MainActivity extends Activity {
             }
         }
         return false;
+    }
+
+    private String classifyChooser(WebChromeClient.FileChooserParams params) {
+        String[] acceptTypes = params.getAcceptTypes();
+        if (acceptTypes == null) return "generic";
+
+        boolean hasAudio = false;
+        boolean hasMedia = false;
+        boolean hasJson = false;
+        boolean hasFont = false;
+        boolean hasSubtitle = false;
+
+        for (String raw : acceptTypes) {
+            if (raw == null) continue;
+            for (String part : raw.split(",")) {
+                String token = part.trim().toLowerCase(Locale.ROOT);
+                if (APK_FOLDER_MIME.equals(token)) return "folder";
+                if (APK_SUBTITLE_MIME.equals(token)) hasSubtitle = true;
+                if (token.startsWith("audio/")) hasAudio = true;
+                if (token.startsWith("image/") || token.startsWith("video/")) hasMedia = true;
+                if (token.contains("json") || ".json".equals(token)) hasJson = true;
+                if (token.startsWith("font/") || token.contains("font") || token.matches("\\.(ttf|otf|woff2?)")) hasFont = true;
+                if (token.matches("\\.(lrc|srt|txt)")) hasSubtitle = true;
+            }
+        }
+        if (hasSubtitle && !hasAudio) return "subtitle";
+        if (hasAudio) return "music";
+        if (hasMedia) return "media";
+        if (hasJson) return "playlist";
+        if (hasFont) return "font";
+        return "generic";
     }
 
     private Intent buildDocumentIntent(WebChromeClient.FileChooserParams params) {
@@ -163,7 +202,7 @@ public class MainActivity extends Activity {
                 if (raw == null) continue;
                 for (String item : raw.split(",")) {
                     String token = item.trim().toLowerCase(Locale.ROOT);
-                    if (token.isEmpty() || APK_FOLDER_MIME.equals(token)) continue;
+                    if (token.isEmpty() || APK_FOLDER_MIME.equals(token) || APK_SUBTITLE_MIME.equals(token)) continue;
 
                     if ("*/*".equals(token)) {
                         out.clear();
@@ -239,6 +278,9 @@ public class MainActivity extends Activity {
             for (Uri uri : result) {
                 persistReadPermission(data, uri);
             }
+            lastPickedFilesJson = buildPickedFilesJson(result, pendingChooserKind);
+        } else {
+            lastPickedFilesJson = "[]";
         }
 
         fileCallback.onReceiveValue(result);
@@ -267,10 +309,13 @@ public class MainActivity extends Activity {
         }
 
         if (files.isEmpty()) {
+            lastPickedFilesJson = "[]";
             fileCallback.onReceiveValue(null);
             Toast.makeText(this, "這個資料夾沒有找到可載入的音樂或 LRC／SRT", Toast.LENGTH_LONG).show();
         } else {
-            fileCallback.onReceiveValue(files.toArray(new Uri[0]));
+            Uri[] selected = files.toArray(new Uri[0]);
+            lastPickedFilesJson = buildPickedFilesJson(selected, "folder");
+            fileCallback.onReceiveValue(selected);
             Toast.makeText(this, "已選取資料夾，共找到 " + files.size() + " 個可用檔案", Toast.LENGTH_SHORT).show();
         }
         fileCallback = null;
@@ -335,6 +380,66 @@ public class MainActivity extends Activity {
                 || lowerName.endsWith(".srt");
     }
 
+    private String buildPickedFilesJson(Uri[] uris, String kind) {
+        JSONArray array = new JSONArray();
+        if (uris == null) return array.toString();
+
+        ContentResolver resolver = getContentResolver();
+        for (Uri uri : uris) {
+            if (uri == null) continue;
+            JSONObject obj = new JSONObject();
+            String name = "";
+            long size = -1L;
+            try (Cursor c = resolver.query(uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}, null, null, null)) {
+                if (c != null && c.moveToFirst()) {
+                    int ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    int si = c.getColumnIndex(OpenableColumns.SIZE);
+                    if (ni >= 0) name = c.getString(ni);
+                    if (si >= 0 && !c.isNull(si)) size = c.getLong(si);
+                }
+            } catch (Exception ignored) {
+            }
+
+            try {
+                obj.put("uri", uri.toString());
+                obj.put("name", name == null ? "" : name);
+                obj.put("mime", resolver.getType(uri) == null ? "" : resolver.getType(uri));
+                obj.put("size", size);
+                obj.put("kind", kind == null ? "" : kind);
+                array.put(obj);
+            } catch (Exception ignored) {
+            }
+        }
+        return array.toString();
+    }
+
+    private String readTextFromUri(String uriString) {
+        if (uriString == null || uriString.trim().isEmpty()) return "";
+        Uri uri;
+        try {
+            uri = Uri.parse(uriString);
+        } catch (Exception e) {
+            return "";
+        }
+
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            if (in == null) return "";
+            byte[] buffer = new byte[8192];
+            int read;
+            int total = 0;
+            final int limit = 8 * 1024 * 1024;
+            while ((read = in.read(buffer)) != -1) {
+                total += read;
+                if (total > limit) break;
+                out.write(buffer, 0, read);
+            }
+            return out.toString(StandardCharsets.UTF_8.name());
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     private void persistReadPermission(Intent data, Uri uri) {
         if (data == null || uri == null) return;
         int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
@@ -377,12 +482,35 @@ public class MainActivity extends Activity {
                 decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
             }
         }
+
+        if (webView != null) {
+            Runnable notifyViewport = () -> {
+                if (webView != null) {
+                    webView.evaluateJavascript(
+                            "(function(){try{if(window.__apkViewportChanged)window.__apkViewportChanged();}catch(e){}})();",
+                            null
+                    );
+                }
+            };
+            webView.postDelayed(notifyViewport, 90);
+            webView.postDelayed(notifyViewport, 280);
+        }
     }
 
     private final class AndroidBridge {
         @JavascriptInterface
         public boolean isApk() {
             return true;
+        }
+
+        @JavascriptInterface
+        public String getLastPickedFilesJson() {
+            return lastPickedFilesJson == null ? "[]" : lastPickedFilesJson;
+        }
+
+        @JavascriptInterface
+        public String readTextUri(String uriString) {
+            return readTextFromUri(uriString);
         }
 
         @JavascriptInterface
@@ -531,6 +659,21 @@ public class MainActivity extends Activity {
         if (fileCallback != null) {
             fileCallback.onReceiveValue(null);
             fileCallback = null;
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView != null) {
+            webView.postDelayed(() -> {
+                if (webView != null) {
+                    webView.evaluateJavascript(
+                            "(function(){try{if(window.__apkResumeUI)window.__apkResumeUI();}catch(e){}})();",
+                            null
+                    );
+                }
+            }, 120);
         }
     }
 
