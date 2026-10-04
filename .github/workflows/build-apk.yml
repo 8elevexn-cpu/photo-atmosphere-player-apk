@@ -27,5 +27,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: photo-atmosphere-player-v0.3.10-apk
+          name: photo-atmosphere-player-v0.3.11-apk
           path: app/build/outputs/apk/debug/app-debug.apk
