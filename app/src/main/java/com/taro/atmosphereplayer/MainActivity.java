@@ -2,14 +2,23 @@ package com.taro.atmosphereplayer;
 
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.SystemClock;
 import android.provider.DocumentsContract;
+import android.provider.MediaStore;
+import android.view.View;
 import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -17,6 +26,12 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -33,6 +48,7 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> fileCallback;
     private long lastBackAt = 0L;
     private boolean backCheckPending = false;
+    private boolean nativeFullscreen = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -59,6 +75,7 @@ public class MainActivity extends Activity {
         s.setTextZoom(100);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
 
+        webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
         webView.setWebViewClient(new WebViewClient());
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -120,7 +137,7 @@ public class MainActivity extends Activity {
             intent.setType(mimeTypes[0]);
         } else {
             intent.setType("*/*");
-            if (mimeTypes.length > 0) {
+            if (mimeTypes.length > 0 && !containsWildcardMime(mimeTypes)) {
                 intent.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes);
             }
         }
@@ -129,6 +146,14 @@ public class MainActivity extends Activity {
             intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         }
         return intent;
+    }
+
+    private boolean containsWildcardMime(String[] mimeTypes) {
+        if (mimeTypes == null) return false;
+        for (String mime : mimeTypes) {
+            if ("*/*".equals(mime)) return true;
+        }
+        return false;
     }
 
     private String[] resolveMimeTypes(String[] acceptTypes) {
@@ -140,11 +165,20 @@ public class MainActivity extends Activity {
                     String token = item.trim().toLowerCase(Locale.ROOT);
                     if (token.isEmpty() || APK_FOLDER_MIME.equals(token)) continue;
 
+                    if ("*/*".equals(token)) {
+                        out.clear();
+                        out.add("*/*");
+                        return out.toArray(new String[0]);
+                    }
+
                     if (token.startsWith(".")) {
                         switch (token) {
                             case ".lrc":
                             case ".srt":
                             case ".txt":
+                                // Some Android document providers classify subtitle files as
+                                // text/plain while others report application/octet-stream.
+                                // Keep both so a subtitle file is not hidden by the picker.
                                 out.add("text/plain");
                                 out.add("application/octet-stream");
                                 break;
@@ -313,12 +347,154 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void setNativeFullscreen(boolean enabled) {
+        nativeFullscreen = enabled;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                if (enabled) {
+                    controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                    controller.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    );
+                } else {
+                    controller.show(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                }
+            }
+        } else {
+            View decor = getWindow().getDecorView();
+            if (enabled) {
+                decor.setSystemUiVisibility(
+                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                                | View.SYSTEM_UI_FLAG_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                );
+            } else {
+                decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+            }
+        }
+    }
+
+    private final class AndroidBridge {
+        @JavascriptInterface
+        public boolean isApk() {
+            return true;
+        }
+
+        @JavascriptInterface
+        public void setFullscreen(boolean enabled) {
+            runOnUiThread(() -> setNativeFullscreen(enabled));
+        }
+
+        @JavascriptInterface
+        public void saveTextFile(String requestedName, String text, String mimeType) {
+            final String fileName = sanitizeFileName(requestedName);
+            final String body = text == null ? "" : text;
+            final String mime = (mimeType == null || mimeType.trim().isEmpty())
+                    ? "text/plain"
+                    : mimeType.split(";", 2)[0].trim();
+
+            new Thread(() -> {
+                boolean success = false;
+                String message = "";
+                String savedName = fileName;
+
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ContentResolver resolver = getContentResolver();
+                        ContentValues values = new ContentValues();
+                        values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+                        values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                        Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                        if (uri == null) throw new IllegalStateException("無法建立下載檔案");
+
+                        boolean wrote = false;
+                        try (OutputStream out = resolver.openOutputStream(uri, "w")) {
+                            if (out == null) throw new IllegalStateException("無法開啟下載檔案");
+                            out.write(body.getBytes(StandardCharsets.UTF_8));
+                            out.flush();
+                            wrote = true;
+                        } finally {
+                            if (wrote) {
+                                ContentValues done = new ContentValues();
+                                done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                                resolver.update(uri, done, null, null);
+                            } else {
+                                resolver.delete(uri, null, null);
+                            }
+                        }
+                        success = true;
+                        message = "已儲存到 Download／下載";
+                    } else {
+                        // Legacy fallback. Modern Android (the target tablet) uses the MediaStore path above.
+                        File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                        if (dir == null) throw new IllegalStateException("找不到下載資料夾");
+                        if (!dir.exists() && !dir.mkdirs()) {
+                            throw new IllegalStateException("無法建立下載資料夾");
+                        }
+                        File target = new File(dir, fileName);
+                        try (FileOutputStream out = new FileOutputStream(target, false)) {
+                            out.write(body.getBytes(StandardCharsets.UTF_8));
+                            out.flush();
+                        }
+                        success = true;
+                        message = "已儲存到應用程式下載資料夾";
+                    }
+                } catch (Exception e) {
+                    success = false;
+                    message = e.getMessage() == null ? "儲存失敗" : e.getMessage();
+                }
+
+                final boolean ok = success;
+                final String finalName = savedName;
+                final String finalMessage = message;
+                runOnUiThread(() -> dispatchDownloadResult(ok, finalName, finalMessage));
+            }).start();
+        }
+    }
+
+    private String sanitizeFileName(String raw) {
+        String name = raw == null ? "export.txt" : raw.trim();
+        if (name.isEmpty()) name = "export.txt";
+        name = name.replaceAll("[\\\\/:*?\"<>|]", "_");
+        if (name.length() > 180) name = name.substring(0, 180);
+        return name;
+    }
+
+    private void dispatchDownloadResult(boolean success, String fileName, String message) {
+        if (webView == null) return;
+        String js = "window.__apkDownloadResult&&window.__apkDownloadResult("
+                + success + ","
+                + JSONObject.quote(fileName == null ? "" : fileName) + ","
+                + JSONObject.quote(message == null ? "" : message)
+                + ");";
+        webView.evaluateJavascript(js, null);
+    }
+
     @Override
     public void onBackPressed() {
         if (webView == null) {
             super.onBackPressed();
             return;
         }
+
+        if (nativeFullscreen) {
+            setNativeFullscreen(false);
+            webView.evaluateJavascript(
+                    "(function(){try{if(window.__apkExitFullscreen)window.__apkExitFullscreen();}catch(e){}})();",
+                    null
+            );
+            lastBackAt = 0L;
+            return;
+        }
+
         if (backCheckPending) return;
 
         backCheckPending = true;
@@ -327,6 +503,7 @@ public class MainActivity extends Activity {
                 value -> {
                     backCheckPending = false;
                     if ("true".equals(value)) {
+                        setNativeFullscreen(false);
                         lastBackAt = 0L;
                         return;
                     }
@@ -360,6 +537,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         clearFileCallback();
+        setNativeFullscreen(false);
         if (webView != null) {
             webView.destroy();
             webView = null;
